@@ -28,7 +28,7 @@ from aiogram.types import (
     ReplyKeyboardRemove,
 )
 from google import genai
-from google.genai import types
+from google.genai import errors, types
 from pptx import Presentation
 from pptx.util import Inches, Pt
 from pydantic import BaseModel, Field
@@ -37,7 +37,7 @@ from pypdf import PdfReader
 # --- SOZLAMALAR (RENDER ENV VARIABLES) ---
 BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_PPT_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "YOUR_GEMINI_API_KEY")
-PEXELS_API_KEY = os.getenv("PEXELS_API_KEY", "YOUR_PEXELS_API_KEY")
+PIXABAY_API_KEY = os.getenv("PIXABAY_API_KEY", "").strip()
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://user:pass@host/db")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "705345765"))
 GIFT_BOT_USERNAME = os.getenv("GIFT_BOT_USERNAME", "giftolishbot").lstrip("@").strip()
@@ -70,7 +70,7 @@ class SlideContent(BaseModel):
     title: str = Field(description="Slayd sarlavhasi (qisqa va aniq)")
     points: List[str] = Field(description="Slaydning asosiy fikrlari (3-4 ta punkt)")
     image_query: str = Field(
-        description="Pexels orqali rasm qidirish uchun 2-3 so'zdan iborat INGLIZCHA kalit so'z"
+        description="Pixabay yoki Wikimedia orqali rasm qidirish uchun 2-3 so'zdan iborat INGLIZCHA kalit so'z"
     )
 
 
@@ -220,7 +220,40 @@ def extract_text_from_bytes(file_bytes: bytes, filename: str) -> str:
     return full_text[:15000]
 
 
-# --- GEMINI ORQALI MATN GENERATSIYA ---
+# --- GEMINI ORQALI MATN GENERATSIYA (404 / 503 FALLBACK BILAN) ---
+async def generate_with_fallback(contents, config):
+    models_to_try = [
+        "gemini-3.8-flash",
+        "gemini-2.5-flash",
+        "gemini-2.5-flash-lite",
+    ]
+
+    last_err = None
+    for model_name in models_to_try:
+        for attempt in range(2):
+            try:
+                return await gemini_client.aio.models.generate_content(
+                    model=model_name,
+                    contents=contents,
+                    config=config,
+                )
+            except errors.ServerError as e:
+                last_err = e
+                if e.code == 503:
+                    await asyncio.sleep(2)
+                    continue
+                raise
+            except errors.ClientError as e:
+                last_err = e
+                if e.code == 404:
+                    break
+                raise
+
+    if isinstance(last_err, errors.ServerError) and last_err.code == 503:
+        raise last_err
+    raise RuntimeError(f"Barcha Gemini modellarida xatolik yuz berdi: {last_err}")
+
+
 async def generate_presentation_content(
     source_text: str, slide_count: int, lang_instruction: str, is_document: bool = False
 ) -> PresentationData:
@@ -239,42 +272,47 @@ async def generate_presentation_content(
         f"2. Muqova (1-slayd) ni hisobga olgan holda, 'slides' ro'yxatida aynan {slide_count - 1} ta "
         f"mazmunli slayd bo'lsin (jami {slide_count} ta slayd).\n"
         f"3. Har bir slaydda 3-4 ta aniq, qisqa punkt bo'lsin (har biri 12-16 so'zdan oshmasin).\n"
-        f"4. 'image_query' maydoniga Pexels saytidan rasm topish uchun 2-3 so'zdan iborat INGLIZCHA kalit so'z yoz."
+        f"4. 'image_query' maydoniga rasm qidirish uchun 2-3 so'zdan iborat INGLIZCHA kalit so'z yoz."
     )
 
-    response = await gemini_client.aio.models.generate_content(
-        model="gemini-3.8-flash",
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=PresentationData,
-            temperature=0.6,
-        ),
+    config = types.GenerateContentConfig(
+        response_mime_type="application/json",
+        response_schema=PresentationData,
+        temperature=0.6,
     )
 
+    response = await generate_with_fallback(prompt, config)
     return PresentationData(**json.loads(response.text))
 
 
-# --- PEXELS API RASM YUKLASH ---
-async def fetch_pexels_image(session: aiohttp.ClientSession, query: str) -> Optional[io.BytesIO]:
-    if not PEXELS_API_KEY or PEXELS_API_KEY == "YOUR_PEXELS_API_KEY":
-        return None
-
-    url = "https://api.pexels.com/v1/search"
-    headers = {"Authorization": PEXELS_API_KEY}
-    params = {"query": query, "per_page": 1, "orientation": "landscape"}
-
+# --- PIXABAY + WIKIMEDIA COMMONS ORQALI RASM YUKLASH ---
+async def fetch_wikimedia_image(session: aiohttp.ClientSession, query: str) -> Optional[io.BytesIO]:
+    url = "https://commons.wikimedia.org/w/api.php"
+    headers = {"User-Agent": "TelegramPresentationBot/1.0 (https://t.me/giftolishbot)"}
+    params = {
+        "action": "query",
+        "format": "json",
+        "generator": "search",
+        "gsrsearch": f"filetype:bitmap {query}",
+        "gsrnamespace": 6,
+        "gsrlimit": 1,
+        "prop": "imageinfo",
+        "iiprop": "url",
+        "iiurlwidth": 1024,
+    }
     try:
         async with session.get(url, headers=headers, params=params, timeout=10) as resp:
             if resp.status != 200:
                 return None
             data = await resp.json()
-            photos = data.get("photos", [])
-            if not photos:
+            pages = data.get("query", {}).get("pages", {})
+            if not pages:
                 return None
-
-            img_url = photos[0]["src"]["large"]
-            async with session.get(img_url, timeout=15) as img_resp:
+            first_page = next(iter(pages.values()))
+            img_url = first_page.get("imageinfo", [{}])[0].get("thumburl")
+            if not img_url:
+                return None
+            async with session.get(img_url, headers=headers, timeout=15) as img_resp:
                 if img_resp.status == 200:
                     return io.BytesIO(await img_resp.read())
     except Exception:
@@ -282,9 +320,36 @@ async def fetch_pexels_image(session: aiohttp.ClientSession, query: str) -> Opti
     return None
 
 
+async def fetch_slide_image(session: aiohttp.ClientSession, query: str) -> Optional[io.BytesIO]:
+    if PIXABAY_API_KEY:
+        url = "https://pixabay.com/api/"
+        params = {
+            "key": PIXABAY_API_KEY,
+            "q": query,
+            "image_type": "photo",
+            "orientation": "horizontal",
+            "per_page": 3,
+            "safesearch": "true",
+        }
+        try:
+            async with session.get(url, params=params, timeout=10) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    hits = data.get("hits", [])
+                    if hits:
+                        img_url = hits[0]["largeImageURL"]
+                        async with session.get(img_url, timeout=15) as img_resp:
+                            if img_resp.status == 200:
+                                return io.BytesIO(await img_resp.read())
+        except Exception:
+            pass
+
+    return await fetch_wikimedia_image(session, query)
+
+
 async def fetch_all_slide_images(slides: List[SlideContent]) -> List[Optional[io.BytesIO]]:
     async with aiohttp.ClientSession() as session:
-        tasks = [fetch_pexels_image(session, slide.image_query) for slide in slides]
+        tasks = [fetch_slide_image(session, slide.image_query) for slide in slides]
         return await asyncio.gather(*tasks)
 
 
@@ -300,7 +365,7 @@ def calculate_optimal_font_size(points: List[str]) -> Pt:
     return Pt(20)
 
 
-# --- .PPTX YIG'ISH (ESKI SLAYDLARNI TOZALASH + AUTO-FIT) ---
+# --- .PPTX YIG'ISH ---
 def build_pptx_with_template(
     data: PresentationData,
     images: List[Optional[io.BytesIO]],
@@ -318,7 +383,6 @@ def build_pptx_with_template(
         prs.slide_width = Inches(13.333)
         prs.slide_height = Inches(7.5)
 
-    # 1. Muqova slaydi
     cover = prs.slides.add_slide(prs.slide_layouts[0])
     if cover.shapes.title:
         cover.shapes.title.text = data.main_title
@@ -328,7 +392,6 @@ def build_pptx_with_template(
             shape.text = data.subtitle
             break
 
-    # 2. Mazmunli slaydlar
     content_layout = prs.slide_layouts[1]
 
     for slide_info, img_stream in zip(data.slides, images):
@@ -596,12 +659,14 @@ async def process_template(callback: CallbackQuery, state: FSMContext):
             c for c in data["display_title"] if c.isalnum() or c in (" ", "-", "_")
         ).rstrip()[:30] or "Prezentatsiya"
 
+        found_imgs = sum(1 for img in images if img is not None)
         await callback.message.answer_document(
             document=FSInputFile(pptx_file, filename=f"{safe_name}.pptx"),
             caption=(
                 f"🎉 <b>Prezentatsiya tayyor!</b>\n\n"
                 f"📌 <b>Sarlavha:</b> {pres_data.main_title}\n"
                 f"📑 <b>Slaydlar:</b> {len(pres_data.slides) + 1} ta\n"
+                f"🖼 <b>Rasmlar:</b> {found_imgs} ta\n"
                 f"Yana yaratish uchun /start bosing."
             ),
             parse_mode=ParseMode.HTML,
@@ -616,6 +681,15 @@ async def process_template(callback: CallbackQuery, state: FSMContext):
         await increment_usage(user_id)
         await status_msg.delete()
 
+    except errors.ServerError as e:
+        logger.exception("Gemini ServerError:")
+        if e.code == 503:
+            await status_msg.edit_text(
+                "⏳ Sun'iy intellekt serverlarida hozir yuklama juda yuqori.\n"
+                "Iltimos, 10-15 soniyadan so'ng qayta urinib ko'ring: /start"
+            )
+        else:
+            await status_msg.edit_text("⚠️ Serverda vaqtinchalik texnik xatolik yuz berdi: /start")
     except Exception:
         logger.exception("Prezentatsiya yaratishda xatolik:")
         await status_msg.edit_text("❌ Xatolik yuz berdi. Qayta urinib ko'ring: /start")
