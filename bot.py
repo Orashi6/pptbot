@@ -33,6 +33,7 @@ from pptx import Presentation
 from pptx.util import Inches, Pt
 from pydantic import BaseModel, Field
 from pypdf import PdfReader
+from google.genai.errors import APIError
 
 # --- SOZLAMALAR (RENDER ENV VARIABLES) ---
 BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_PPT_BOT_TOKEN")
@@ -41,6 +42,10 @@ PIXABAY_API_KEY = os.getenv("PIXABAY_API_KEY", "").strip()
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://user:pass@host/db")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "705345765"))
 GIFT_BOT_USERNAME = os.getenv("GIFT_BOT_USERNAME", "giftolishbot").lstrip("@").strip()
+
+API_KEYS = os.getenv("API_KEYS", "YORU API KEYS")
+MODELS = ["gemini-3.8-flash", "gemini-3.8-flash-lite", "gemini-3-flash-preview"]
+
 
 WEEKLY_FREE_LIMIT = 3
 PORT = int(os.getenv("PORT", 8080))
@@ -821,6 +826,30 @@ async def main():
     await bot.delete_webhook(drop_pending_updates=True)
     logger.info("Prezentatsiya boti ishga tushdi...")
     await dp.start_polling(bot)
+
+
+async def generate_with_fallback(prompt: str):
+    last_error = None
+    for model in MODELS:
+        for idx, api_key in enumerate(API_KEYS, start=1):
+            client = genai.Client(api_key=api_key)
+            try:
+                response = await client.aio.models.generate_content(
+                    model=model,
+                    contents=prompt,
+                )
+                return response.text
+            except APIError as e:
+                last_error = e
+                if e.code == 404:
+                    # Model deprecated/unavailable -> skip remaining keys for this model
+                    break
+                if e.code == 429:
+                    # Quota hit -> try next project's key, or move to next model
+                    await asyncio.sleep(1)
+                    continue
+                raise
+    raise RuntimeError(f"All Gemini models/keys exhausted: {last_error}")
 
 
 if __name__ == "__main__":
