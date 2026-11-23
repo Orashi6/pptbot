@@ -46,6 +46,27 @@ GIFT_BOT_USERNAME = os.getenv("GIFT_BOT_USERNAME", "giftolishbot").lstrip("@").s
 API_KEYS = os.getenv("API_KEYS", "YORU API KEYS")
 MODELS = ["gemini-3.8-flash", "gemini-3.8-flash-lite", "gemini-3-flash-preview"]
 
+async def generate_with_fallback(prompt: str, config=None):
+    last_error = None
+    for model in MODELS:
+        for idx, api_key in enumerate(API_KEYS, start=1):
+            client = genai.Client(api_key=api_key)
+            try:
+                response = await client.aio.models.generate_content(
+                    model=model,
+                    contents=prompt,
+                    config=config,
+                )
+                return response
+            except APIError as e:
+                last_error = e
+                if e.code == 404:
+                    break  # Model deprecated -> skip remaining keys for this model
+                if e.code == 429:
+                    await asyncio.sleep(1)
+                    continue
+                raise
+    raise RuntimeError(f"All Gemini models/keys exhausted: {last_error}")
 
 WEEKLY_FREE_LIMIT = 3
 PORT = int(os.getenv("PORT", 8080))
@@ -851,6 +872,8 @@ async def generate_with_fallback(prompt: str):
                 raise
     raise RuntimeError(f"All Gemini models/keys exhausted: {last_error}")
 
+await bot.delete_webhook(drop_pending_updates=True)
+await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
