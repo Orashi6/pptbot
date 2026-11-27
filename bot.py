@@ -4,8 +4,11 @@ import io
 import logging
 import os
 import re
+import shutil
 import subprocess
 import tempfile
+import textwrap
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -33,7 +36,7 @@ from aiogram.types import (
 from aiohttp import web
 from google import genai
 from google.genai import errors, types
-from PIL import Image, ImageOps
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 from pptx import Presentation
 from pptx.dml.color import RGBColor
 from pptx.enum.shapes import MSO_SHAPE
@@ -85,8 +88,8 @@ def _parse_api_keys() -> List[str]:
 def _parse_models() -> List[str]:
     default_models = [
         "gemini-3.8-flash",
-        "gemini-3.6-flash",
         "gemini-3.5-flash-lite",
+        "gemini-3.6-flash",
         "gemini-2.5-flash",
     ]
     raw = os.getenv("GEMINI_MODELS", "").strip()
@@ -99,11 +102,13 @@ def _parse_models() -> List[str]:
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 GEMINI_API_KEYS = _parse_api_keys()
 GEMINI_MODELS = _parse_models()
+GEMINI_TIMEOUT_SEC = _parse_int_env("GEMINI_TIMEOUT_SEC", 25)
 PIXABAY_API_KEY = os.getenv("PIXABAY_API_KEY", "").strip()
 PEXELS_API_KEY = os.getenv("PEXELS_API_KEY", "").strip()
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 ADMIN_ID = _parse_int_env("ADMIN_ID", 705345765)
 GIFT_BOT_USERNAME = os.getenv("GIFT_BOT_USERNAME", "giftolishbot").lstrip("@").strip()
+USE_CUSTOM_TEMPLATES = os.getenv("USE_CUSTOM_TEMPLATES", "false").strip().lower() == "true"
 
 WEEKLY_FREE_LIMIT = _parse_int_env("WEEKLY_FREE_LIMIT", 3)
 FREE_MAX_SLIDES = _parse_int_env("FREE_MAX_SLIDES", 10)
@@ -120,12 +125,14 @@ class ThemePalette:
     template_path: str
     bg_cover: Tuple[int, int, int]
     bg_slide: Tuple[int, int, int]
+    header_bg: Tuple[int, int, int]
+    header_text: Tuple[int, int, int]
     card_bg: Tuple[int, int, int]
+    card_border: Tuple[int, int, int]
     primary: Tuple[int, int, int]
     secondary: Tuple[int, int, int]
     cover_title: Tuple[int, int, int]
     cover_subtitle: Tuple[int, int, int]
-    slide_title: Tuple[int, int, int]
     body_text: Tuple[int, int, int]
     muted_text: Tuple[int, int, int]
     font_name: str = "DejaVu Sans"
@@ -135,72 +142,82 @@ THEMES: Dict[str, ThemePalette] = {
     "dark": ThemePalette(
         label="🌙 Dark Modern",
         template_path="templates/template_dark.pptx",
-        bg_cover=(15, 23, 42),       # #0F172A
-        bg_slide=(17, 24, 39),       # #111827
-        card_bg=(30, 41, 59),        # #1E293B
-        primary=(56, 189, 248),      # #38BDF8
-        secondary=(129, 140, 248),   # #818CF8
+        bg_cover=(11, 17, 32),        # #0B1120
+        bg_slide=(15, 23, 42),        # #0F172A
+        header_bg=(22, 33, 58),       # #16213A
+        header_text=(248, 250, 252),
+        card_bg=(30, 41, 59),         # #1E293B
+        card_border=(56, 189, 248),   # #38BDF8
+        primary=(56, 189, 248),       # #38BDF8
+        secondary=(129, 140, 248),    # #818CF8
         cover_title=(248, 250, 252),
-        cover_subtitle=(148, 163, 184),
-        slide_title=(248, 250, 252),
+        cover_subtitle=(186, 204, 226),
         body_text=(226, 232, 240),
         muted_text=(148, 163, 184),
     ),
     "business": ThemePalette(
         label="💼 Business",
         template_path="templates/template_business.pptx",
-        bg_cover=(23, 37, 84),       # #172554
-        bg_slide=(248, 250, 252),    # #F8FAFC
+        bg_cover=(23, 37, 84),        # #172554
+        bg_slide=(232, 238, 246),     # #E8EEF6 (aniq ko'rinadigan och ko'k-kulrang)
+        header_bg=(30, 58, 138),      # #1E3A8A
+        header_text=(255, 255, 255),
         card_bg=(255, 255, 255),
-        primary=(30, 58, 138),       # #1E3A8A
-        secondary=(217, 119, 6),     # #D97706
+        card_border=(191, 207, 228),
+        primary=(30, 58, 138),        # #1E3A8A
+        secondary=(217, 119, 6),      # #D97706 (Oltin aksent)
         cover_title=(255, 255, 255),
-        cover_subtitle=(203, 213, 225),
-        slide_title=(15, 23, 42),
-        body_text=(51, 65, 85),
-        muted_text=(100, 116, 139),
+        cover_subtitle=(219, 234, 254),
+        body_text=(30, 41, 59),
+        muted_text=(71, 85, 105),
     ),
     "minimal": ThemePalette(
         label="⚪ Minimalist",
         template_path="templates/template_minimal.pptx",
-        bg_cover=(250, 250, 250),
-        bg_slide=(255, 255, 255),
-        card_bg=(244, 244, 245),
-        primary=(79, 70, 229),       # #4F46E5
-        secondary=(161, 161, 170),
-        cover_title=(17, 24, 39),
-        cover_subtitle=(82, 82, 91),
-        slide_title=(17, 24, 39),
-        body_text=(39, 39, 42),
-        muted_text=(113, 113, 122),
+        bg_cover=(24, 24, 37),        # Zamonaviy to'q grafit muqova
+        bg_slide=(241, 245, 249),     # #F1F5F9
+        header_bg=(255, 255, 255),
+        header_text=(15, 23, 42),
+        card_bg=(255, 255, 255),
+        card_border=(203, 213, 225),
+        primary=(79, 70, 229),        # #4F46E5
+        secondary=(14, 165, 233),     # #0EA5E9
+        cover_title=(255, 255, 255),
+        cover_subtitle=(203, 213, 225),
+        body_text=(30, 41, 59),
+        muted_text=(100, 116, 139),
     ),
     "academic": ThemePalette(
         label="🌿 Akademik",
         template_path="templates/template_academic.pptx",
-        bg_cover=(20, 83, 45),       # #14532D
-        bg_slide=(250, 249, 245),    # Warm ivory
+        bg_cover=(20, 83, 45),        # #14532D
+        bg_slide=(236, 244, 238),     # #ECF4EE (yumshoq yashil-krem)
+        header_bg=(20, 83, 45),       # #14532D
+        header_text=(255, 255, 255),
         card_bg=(255, 255, 255),
-        primary=(21, 128, 61),       # #15803D
-        secondary=(202, 138, 4),     # #CA8A04
+        card_border=(187, 222, 198),
+        primary=(21, 128, 61),        # #15803D
+        secondary=(202, 138, 4),      # #CA8A04
         cover_title=(255, 255, 255),
         cover_subtitle=(220, 252, 231),
-        slide_title=(20, 83, 45),
-        body_text=(31, 41, 55),
-        muted_text=(107, 114, 128),
+        body_text=(28, 39, 51),
+        muted_text=(75, 99, 85),
     ),
     "creative": ThemePalette(
         label="🚀 Kreativ Tech",
         template_path="templates/template_creative.pptx",
-        bg_cover=(49, 16, 104),      # Deep violet
-        bg_slide=(249, 247, 255),
-        card_bg=(255, 255, 255),
-        primary=(124, 58, 237),      # #7C3AED
-        secondary=(236, 72, 153),    # #EC4899
+        bg_cover=(38, 13, 82),        # Chuqur binafsha
+        bg_slide=(26, 16, 61),        # #1A103D (boy kreativ to'q fon)
+        header_bg=(46, 23, 102),      # #2E1766
+        header_text=(255, 255, 255),
+        card_bg=(42, 27, 94),         # #2A1B5E
+        card_border=(168, 85, 247),   # #A855F7
+        primary=(168, 85, 247),       # #A855F7
+        secondary=(236, 72, 153),     # #EC4899
         cover_title=(255, 255, 255),
         cover_subtitle=(233, 213, 255),
-        slide_title=(46, 16, 101),
-        body_text=(55, 48, 74),
-        muted_text=(124, 115, 150),
+        body_text=(243, 232, 255),
+        muted_text=(196, 181, 253),
     ),
 }
 
@@ -235,6 +252,8 @@ STYLES = {
 router = Router()
 db_pool: Optional[asyncpg.Pool] = None
 _gemini_clients: Dict[str, genai.Client] = {}
+_model_cooldown_until: Dict[str, float] = {}
+_key_model_cooldown_until: Dict[Tuple[str, str], float] = {}
 ACTIVE_GENERATIONS: Set[int] = set()
 
 
@@ -243,7 +262,7 @@ ACTIVE_GENERATIONS: Set[int] = set()
 # ==============================================================================
 class SlideContent(BaseModel):
     title: str = Field(description="Slayd sarlavhasi (qisqa, 3-7 so'z)")
-    points: List[str] = Field(description="Slaydning asosiy fikrlari (3-5 ta aniq va qisqa punkt)")
+    points: List[str] = Field(description="Slaydning asosiy fikrlari (3-4 ta aniq va qisqa punkt)")
     image_query: str = Field(
         description="Pixabay/Pexels/Wikimedia orqali sifatli rasm qidirish uchun 2-4 so'zdan iborat INGLIZCHA kalit so'z"
     )
@@ -491,7 +510,7 @@ def extract_text_from_bytes(file_bytes: bytes, filename: str) -> str:
 
 
 # ==============================================================================
-# GEMINI AI GENERATSIYA (MULTI-KEY & MULTI-MODEL FALLBACK)
+# GEMINI AI GENERATSIYA (TEZKOR SMART COOLDOWN + MULTI-KEY FALLBACK)
 # ==============================================================================
 def _get_gemini_client(api_key: str) -> genai.Client:
     client = _gemini_clients.get(api_key)
@@ -517,61 +536,92 @@ async def generate_with_fallback(contents: str, config: types.GenerateContentCon
 
     last_error: Optional[Exception] = None
     bad_keys: Set[str] = set()
+    now = time.monotonic()
 
-    for model_name in GEMINI_MODELS:
-        model_not_found = False
+    # Cooldown'da bo'lmagan modellarni birinchi sinaymiz; hammasi cooldown'da bo'lsa baribir hammasini sinaymiz
+    active_models = [m for m in GEMINI_MODELS if _model_cooldown_until.get(m, 0) <= now]
+    cooling_models = [m for m in GEMINI_MODELS if _model_cooldown_until.get(m, 0) > now]
+    ordered_models = active_models + cooling_models
+
+    for model_name in ordered_models:
+        skip_model = False
+
         for key_idx, api_key in enumerate(GEMINI_API_KEYS, start=1):
             if api_key in bad_keys:
                 continue
+            if _key_model_cooldown_until.get((model_name, api_key), 0) > time.monotonic():
+                continue
 
             client = _get_gemini_client(api_key)
-            for attempt in range(2):
-                try:
-                    response = await client.aio.models.generate_content(
+            try:
+                response = await asyncio.wait_for(
+                    client.aio.models.generate_content(
                         model=model_name,
                         contents=contents,
                         config=config,
-                    )
-                    if response and (getattr(response, "parsed", None) or getattr(response, "text", None)):
-                        return response
-                    raise RuntimeError(f"Gemini bo'sh javob qaytardi (model={model_name})")
-                except errors.APIError as e:
-                    last_error = e
-                    code = getattr(e, "code", None)
-                    logger.warning(
-                        "Gemini APIError | model=%s | key=#%d | attempt=%d | code=%s | %s",
-                        model_name,
-                        key_idx,
-                        attempt + 1,
-                        code,
-                        e,
-                    )
-                    if code == 404:
-                        model_not_found = True
-                        break
-                    if _is_invalid_key_error(e):
-                        bad_keys.add(api_key)
-                        break
-                    if code == 429:
-                        await asyncio.sleep(1.0)
-                        break  # Keyingi kalitga (yoki modelga) o'tamiz
-                    if code in (500, 502, 503, 504):
-                        await asyncio.sleep(2.0 * (attempt + 1))
-                        continue
-                    break
-                except Exception as e:
-                    last_error = e
-                    logger.warning(
-                        "Gemini kutilmagan xato | model=%s | key=#%d | %s",
-                        model_name,
-                        key_idx,
-                        e,
-                    )
-                    await asyncio.sleep(1.0)
+                    ),
+                    timeout=GEMINI_TIMEOUT_SEC,
+                )
+                if response and (getattr(response, "parsed", None) or getattr(response, "text", None)):
+                    logger.info("Gemini muvaffaqiyatli javob berdi | model=%s | key=#%d", model_name, key_idx)
+                    return response
+                raise RuntimeError(f"Gemini bo'sh javob qaytardi (model={model_name})")
+
+            except asyncio.TimeoutError:
+                last_error = TimeoutError(f"Gemini timeout ({GEMINI_TIMEOUT_SEC}s) model={model_name}")
+                logger.warning(
+                    "Gemini timeout (%ds) | model=%s | key=#%d -> keyingi modelga o'tilmoqda",
+                    GEMINI_TIMEOUT_SEC,
+                    model_name,
+                    key_idx,
+                )
+                _model_cooldown_until[model_name] = time.monotonic() + 90
+                skip_model = True
+                break
+
+            except errors.APIError as e:
+                last_error = e
+                code = getattr(e, "code", None)
+                err_text = str(e)
+                logger.warning(
+                    "Gemini APIError | model=%s | key=#%d | code=%s | %s",
+                    model_name,
+                    key_idx,
+                    code,
+                    err_text[:220],
+                )
+
+                if code == 404:
+                    _model_cooldown_until[model_name] = time.monotonic() + 3600
+                    skip_model = True
                     break
 
-            if model_not_found:
+                if code in (500, 502, 503, 504):
+                    # 503 model bo'yicha umumiy yuklama -> boshqa kalitlarda vaqt yo'qotmay, keyingi modelga o'tamiz!
+                    _model_cooldown_until[model_name] = time.monotonic() + 90
+                    skip_model = True
+                    break
+
+                if _is_invalid_key_error(e):
+                    bad_keys.add(api_key)
+                    continue
+
+                if code == 429:
+                    # Kunlik limit tugagan bo'lsa 30 daqiqa, oddiy rate limit bo'lsa 60 soniya o'tkazib yuboramiz
+                    cooldown = 1800 if ("PerDay" in err_text or "per day" in err_text.lower()) else 60
+                    _key_model_cooldown_until[(model_name, api_key)] = time.monotonic() + cooldown
+                    continue
+
+                skip_model = True
                 break
+
+            except Exception as e:
+                last_error = e
+                logger.warning("Gemini kutilmagan xato | model=%s | key=#%d | %s", model_name, key_idx, e)
+                continue
+
+        if skip_model:
+            continue
 
     if isinstance(last_error, errors.ServerError) and getattr(last_error, "code", None) == 503:
         raise last_error
@@ -618,11 +668,14 @@ async def generate_presentation_content(
         "7. 'conclusion_points' maydoniga prezentatsiyani yakunlovchi 3 ta eng muhim xulosa punktini yoz."
     )
 
-    config = types.GenerateContentConfig(
-        response_mime_type="application/json",
-        response_schema=PresentationData,
-        temperature=0.6,
-    )
+    config_kwargs = {
+        "response_mime_type": "application/json",
+        "response_schema": PresentationData,
+        "temperature": 0.6,
+    }
+    if hasattr(types, "AutomaticFunctionCallingConfig"):
+        config_kwargs["automatic_function_calling"] = types.AutomaticFunctionCallingConfig(disable=True)
+    config = types.GenerateContentConfig(**config_kwargs)
 
     last_parse_err: Optional[Exception] = None
     for _ in range(2):
@@ -640,7 +693,6 @@ async def generate_presentation_content(
                 continue
 
         if pres.slides:
-            # Slaydlar sonini kerakli chegarada ushlash
             pres.slides = pres.slides[:content_slides_count]
             return pres
 
@@ -693,7 +745,7 @@ async def _download_valid_image(
         async with session.get(
             img_url,
             headers=headers,
-            timeout=aiohttp.ClientTimeout(total=15),
+            timeout=aiohttp.ClientTimeout(total=12),
         ) as resp:
             if resp.status != 200:
                 return None
@@ -781,7 +833,7 @@ async def fetch_wikimedia_image(
     used_urls: Set[str],
 ) -> Optional[io.BytesIO]:
     url = "https://commons.wikimedia.org/w/api.php"
-    headers = {"User-Agent": "TelegramPresentationBot/2.0 (https://t.me/giftolishbot)"}
+    headers = {"User-Agent": "TelegramPresentationBot/2.1 (https://t.me/giftolishbot)"}
     params = {
         "action": "query",
         "format": "json",
@@ -835,7 +887,6 @@ async def fetch_slide_image(
             img = await fetcher(session, clean_query, used_urls)
             if img is not None:
                 return img
-        # Agar murakkab so'rov topilmasa, birinchi 2 ta so'z bilan qayta urinamiz
         short_q = " ".join(clean_query.split()[:2])
         if short_q and short_q != clean_query:
             for fetcher in (fetch_pixabay_image, fetch_pexels_image, fetch_wikimedia_image):
@@ -854,7 +905,7 @@ async def fetch_all_slide_images(slides: List[SlideContent]) -> List[Optional[io
 
 
 # ==============================================================================
-# .PPTX YIG'ISH (ZAMONAVIY DIZAYN + SHABLON QO'LLAB-QUVVATLASH)
+# .PPTX YIG'ISH (HAR QANDAY VIEWERDA RANG-BARANG KO'RINADIGAN ZAMONAVIY DIZAYN)
 # ==============================================================================
 def calculate_optimal_font_size(points: List[str], has_image: bool) -> Pt:
     total_chars = sum(len(p) for p in points)
@@ -876,20 +927,62 @@ def calculate_optimal_font_size(points: List[str], has_image: bool) -> Pt:
 
 
 def _set_slide_bg(slide, color: Tuple[int, int, int]) -> None:
+    """Ham <p:bg>, ham to'liq o'lchamli fon to'rtburchagi qo'shadi (iOS/Android/WPS da 100% ishlaydi)."""
     fill = slide.background.fill
     fill.solid()
     fill.fore_color.rgb = RGBColor(*color)
 
+    bg_rect = slide.shapes.add_shape(
+        MSO_SHAPE.RECTANGLE, Inches(0), Inches(0), Inches(13.333), Inches(7.5)
+    )
+    bg_rect.fill.solid()
+    bg_rect.fill.fore_color.rgb = RGBColor(*color)
+    bg_rect.line.fill.background()
 
-def _add_rect(slide, left, top, width, height, color: Tuple[int, int, int], rounded: bool = False):
+
+def _add_rect(
+    slide,
+    left,
+    top,
+    width,
+    height,
+    color: Tuple[int, int, int],
+    rounded: bool = False,
+    border_color: Optional[Tuple[int, int, int]] = None,
+    border_pt: float = 1.25,
+):
     shape_type = MSO_SHAPE.ROUNDED_RECTANGLE if rounded else MSO_SHAPE.RECTANGLE
     shape = slide.shapes.add_shape(shape_type, left, top, width, height)
     shape.fill.solid()
     shape.fill.fore_color.rgb = RGBColor(*color)
-    shape.line.fill.background()
+    if border_color is not None:
+        shape.line.color.rgb = RGBColor(*border_color)
+        shape.line.width = Pt(border_pt)
+    else:
+        shape.line.fill.background()
     if rounded and shape.adjustments:
         shape.adjustments[0] = 0.04
     return shape
+
+
+def _set_run_text(
+    paragraph,
+    text: str,
+    font_name: str,
+    font_size: Pt,
+    color: Tuple[int, int, int],
+    bold: bool = False,
+    align: Optional[PP_ALIGN] = None,
+) -> None:
+    """Matnni aynan Run darajasida formatlaydi — barcha mobil va desktop PPTX dasturlarda bir xil ko'rinadi."""
+    if align is not None:
+        paragraph.alignment = align
+    run = paragraph.add_run()
+    run.text = text
+    run.font.name = font_name
+    run.font.size = font_size
+    run.font.bold = bold
+    run.font.color.rgb = RGBColor(*color)
 
 
 def _set_notes(slide, notes_text: str) -> None:
@@ -920,6 +1013,7 @@ def _build_styled_pptx(
     _, _, conclusion_heading, thank_you_text = LANGUAGES[lang_key]
     total_slides = len(data.slides) + 2  # Cover + Content + Closing
     today_str = datetime.now().strftime("%d.%m.%Y")
+    clean_style_badge = re.sub(r"^[^\w]+", "", style_label).strip().upper() or "PRESENTATION"
 
     # ------------------------------------------------------------------
     # 1. MUQOVA SLAYDI (COVER SLIDE)
@@ -927,56 +1021,66 @@ def _build_styled_pptx(
     cover = prs.slides.add_slide(blank_layout)
     _set_slide_bg(cover, theme.bg_cover)
 
-    # Chap vertikal aksent chizig'i va o'ng bezak bloklari
-    _add_rect(cover, Inches(0), Inches(0), Inches(0.32), Inches(7.5), theme.primary)
-    _add_rect(cover, Inches(10.8), Inches(0), Inches(2.533), Inches(7.5), theme.primary)
-    _add_rect(cover, Inches(10.45), Inches(0), Inches(0.35), Inches(7.5), theme.secondary)
+    # Chap aksent chizig'i va o'ng geometrik dizayn paneli
+    _add_rect(cover, Inches(0), Inches(0), Inches(0.35), Inches(7.5), theme.primary)
+    _add_rect(cover, Inches(10.55), Inches(0), Inches(2.783), Inches(7.5), theme.primary)
+    _add_rect(cover, Inches(10.18), Inches(0), Inches(0.37), Inches(7.5), theme.secondary)
+    _add_rect(cover, Inches(11.15), Inches(1.1), Inches(1.6), Inches(1.6), theme.bg_cover, rounded=True)
+    _add_rect(cover, Inches(11.15), Inches(3.15), Inches(1.6), Inches(0.22), theme.secondary, rounded=True)
+    _add_rect(cover, Inches(11.15), Inches(3.6), Inches(1.1), Inches(0.22), theme.bg_cover, rounded=True)
 
     # Yuqori uslub nishoni (badge)
-    badge = _add_rect(cover, Inches(0.95), Inches(1.0), Inches(3.2), Inches(0.48), theme.primary, rounded=True)
+    badge = _add_rect(cover, Inches(0.95), Inches(0.95), Inches(3.4), Inches(0.5), theme.primary, rounded=True)
     badge_tf = badge.text_frame
     badge_tf.vertical_anchor = MSO_ANCHOR.MIDDLE
-    badge_p = badge_tf.paragraphs[0]
-    badge_p.alignment = PP_ALIGN.CENTER
-    badge_p.text = re.sub(r"^[^\w]+", "", style_label).strip().upper()
-    badge_p.font.name = theme.font_name
-    badge_p.font.size = Pt(11)
-    badge_p.font.bold = True
-    badge_p.font.color.rgb = RGBColor(255, 255, 255)
+    _set_run_text(
+        badge_tf.paragraphs[0],
+        clean_style_badge,
+        theme.font_name,
+        Pt(11.5),
+        (255, 255, 255),
+        bold=True,
+        align=PP_ALIGN.CENTER,
+    )
 
     # Asosiy sarlavha
-    title_box = cover.shapes.add_textbox(Inches(0.95), Inches(1.85), Inches(9.0), Inches(2.4))
+    title_box = cover.shapes.add_textbox(Inches(0.95), Inches(1.8), Inches(8.8), Inches(2.45))
     title_tf = title_box.text_frame
     title_tf.word_wrap = True
-    tp = title_tf.paragraphs[0]
-    tp.text = data.main_title
-    tp.font.name = theme.font_name
-    tp.font.bold = True
-    tp.font.size = Pt(34 if len(data.main_title) > 55 else 42)
-    tp.font.color.rgb = RGBColor(*theme.cover_title)
+    _set_run_text(
+        title_tf.paragraphs[0],
+        data.main_title,
+        theme.font_name,
+        Pt(34 if len(data.main_title) > 55 else 42),
+        theme.cover_title,
+        bold=True,
+    )
 
     # Ajratuvchi aksent chiziq
-    _add_rect(cover, Inches(0.95), Inches(4.45), Inches(2.1), Inches(0.08), theme.secondary)
+    _add_rect(cover, Inches(0.95), Inches(4.4), Inches(2.3), Inches(0.09), theme.secondary)
 
     # Tavsif (subtitle)
-    sub_box = cover.shapes.add_textbox(Inches(0.95), Inches(4.75), Inches(8.8), Inches(1.3))
+    sub_box = cover.shapes.add_textbox(Inches(0.95), Inches(4.72), Inches(8.6), Inches(1.35))
     sub_tf = sub_box.text_frame
     sub_tf.word_wrap = True
-    sp = sub_tf.paragraphs[0]
-    sp.text = data.subtitle
-    sp.font.name = theme.font_name
-    sp.font.size = Pt(19)
-    sp.font.color.rgb = RGBColor(*theme.cover_subtitle)
+    _set_run_text(
+        sub_tf.paragraphs[0],
+        data.subtitle,
+        theme.font_name,
+        Pt(19),
+        theme.cover_subtitle,
+    )
 
     # Pastki muallif va sana
     footer_meta = f"{author_name}  •  {today_str}" if author_name else today_str
     meta_box = cover.shapes.add_textbox(Inches(0.95), Inches(6.55), Inches(8.5), Inches(0.45))
-    meta_tf = meta_box.text_frame
-    mp = meta_tf.paragraphs[0]
-    mp.text = footer_meta
-    mp.font.name = theme.font_name
-    mp.font.size = Pt(13)
-    mp.font.color.rgb = RGBColor(*theme.cover_subtitle)
+    _set_run_text(
+        meta_box.text_frame.paragraphs[0],
+        footer_meta,
+        theme.font_name,
+        Pt(13),
+        theme.cover_subtitle,
+    )
 
     # ------------------------------------------------------------------
     # 2. MAZMUNLI SLAYDLAR (CONTENT SLIDES)
@@ -987,35 +1091,37 @@ def _build_styled_pptx(
         slide = prs.slides.add_slide(blank_layout)
         _set_slide_bg(slide, theme.bg_slide)
 
-        # Yuqori aksent chiziq
-        _add_rect(slide, Inches(0), Inches(0), Inches(13.333), Inches(0.12), theme.primary)
+        # To'liq yuqori sarlavha paneli (header banner)
+        _add_rect(slide, Inches(0), Inches(0), Inches(13.333), Inches(1.22), theme.header_bg)
+        _add_rect(slide, Inches(0), Inches(1.22), Inches(13.333), Inches(0.06), theme.secondary)
 
         # Slayd raqami nishoni
-        num_badge = _add_rect(slide, Inches(0.65), Inches(0.45), Inches(0.68), Inches(0.55), theme.primary, rounded=True)
+        num_badge = _add_rect(slide, Inches(0.6), Inches(0.32), Inches(0.72), Inches(0.58), theme.primary, rounded=True)
         ntf = num_badge.text_frame
         ntf.vertical_anchor = MSO_ANCHOR.MIDDLE
-        np = ntf.paragraphs[0]
-        np.alignment = PP_ALIGN.CENTER
-        np.text = f"{idx - 1:02d}"
-        np.font.name = theme.font_name
-        np.font.bold = True
-        np.font.size = Pt(16)
-        np.font.color.rgb = RGBColor(255, 255, 255)
+        _set_run_text(
+            ntf.paragraphs[0],
+            f"{idx - 1:02d}",
+            theme.font_name,
+            Pt(16),
+            (255, 255, 255),
+            bold=True,
+            align=PP_ALIGN.CENTER,
+        )
 
         # Slayd sarlavhasi
-        st_box = slide.shapes.add_textbox(Inches(1.5), Inches(0.4), Inches(11.1), Inches(0.75))
+        st_box = slide.shapes.add_textbox(Inches(1.5), Inches(0.24), Inches(11.2), Inches(0.76))
         st_tf = st_box.text_frame
         st_tf.word_wrap = True
         st_tf.vertical_anchor = MSO_ANCHOR.MIDDLE
-        stp = st_tf.paragraphs[0]
-        stp.text = slide_info.title
-        stp.font.name = theme.font_name
-        stp.font.bold = True
-        stp.font.size = Pt(24 if len(slide_info.title) > 48 else 27)
-        stp.font.color.rgb = RGBColor(*theme.slide_title)
-
-        # Sarlavha ostidagi yupqa chiziq
-        _add_rect(slide, Inches(0.65), Inches(1.22), Inches(12.03), Inches(0.03), theme.secondary)
+        _set_run_text(
+            st_tf.paragraphs[0],
+            slide_info.title,
+            theme.font_name,
+            Pt(23 if len(slide_info.title) > 48 else 26),
+            theme.header_text,
+            bold=True,
+        )
 
         has_image = img_stream is not None
         image_on_left = has_image and (idx % 2 == 1)
@@ -1028,18 +1134,17 @@ def _build_styled_pptx(
                 card_left, img_left = Inches(0.65), Inches(7.43)
                 card_width, img_width = Inches(6.43), Inches(5.25)
 
-            img_top = Inches(1.68)
-            img_height = Inches(3.94)  # 4:3 nisbat (5.25 / 3.94 = 1.332)
+            img_top = Inches(1.92)
+            img_height = Inches(3.94)  # 4:3 nisbat
 
-            # Rasm orqasidagi nafis soya/ramka
+            # Rasm orqasidagi aksent ramka
             _add_rect(
                 slide,
-                img_left + Inches(0.1),
-                img_top + Inches(0.1),
+                img_left + Inches(0.12),
+                img_top + Inches(0.12),
                 img_width,
                 img_height,
                 theme.secondary,
-                rounded=False,
             )
             try:
                 img_stream.seek(0)
@@ -1056,19 +1161,29 @@ def _build_styled_pptx(
             card_left = Inches(0.65)
             card_width = Inches(12.03)
 
-        # Matn kartasi
-        card_top = Inches(1.58)
-        card_height = Inches(5.15)
-        _add_rect(slide, card_left, card_top, card_width, card_height, theme.card_bg, rounded=True)
+        # Matn kartasi (aniq chegarali)
+        card_top = Inches(1.62)
+        card_height = Inches(5.1)
+        _add_rect(
+            slide,
+            card_left,
+            card_top,
+            card_width,
+            card_height,
+            theme.card_bg,
+            rounded=True,
+            border_color=theme.card_border,
+            border_pt=1.2,
+        )
         # Karta chap aksent chizig'i
-        _add_rect(slide, card_left, card_top + Inches(0.25), Inches(0.09), card_height - Inches(0.5), theme.primary)
+        _add_rect(slide, card_left, card_top + Inches(0.25), Inches(0.1), card_height - Inches(0.5), theme.primary)
 
         # Punktlar matni
         body_box = slide.shapes.add_textbox(
             card_left + Inches(0.35),
-            card_top + Inches(0.3),
+            card_top + Inches(0.28),
             card_width - Inches(0.6),
-            card_height - Inches(0.55),
+            card_height - Inches(0.52),
         )
         tf = body_box.text_frame
         tf.word_wrap = True
@@ -1078,39 +1193,32 @@ def _build_styled_pptx(
         for p_idx, point in enumerate(slide_info.points):
             p = tf.paragraphs[0] if p_idx == 0 else tf.add_paragraph()
             p.space_after = Pt(14 if len(slide_info.points) <= 4 else 10)
-            p.line_spacing = 1.2
+            p.line_spacing = 1.22
 
-            bullet_run = p.add_run()
-            bullet_run.text = "▪  "
-            bullet_run.font.name = theme.font_name
-            bullet_run.font.bold = True
-            bullet_run.font.size = font_size
-            bullet_run.font.color.rgb = RGBColor(*theme.primary)
+            _set_run_text(p, "▪  ", theme.font_name, font_size, theme.primary, bold=True)
+            _set_run_text(p, point.strip(), theme.font_name, font_size, theme.body_text)
 
-            text_run = p.add_run()
-            text_run.text = point.strip()
-            text_run.font.name = theme.font_name
-            text_run.font.size = font_size
-            text_run.font.color.rgb = RGBColor(*theme.body_text)
-
-        # Pastki footer (chapda sarlavha, o'ngda sahifa raqami)
+        # Pastki footer
         f_left = slide.shapes.add_textbox(Inches(0.65), Inches(6.95), Inches(9.5), Inches(0.35))
-        flp = f_left.text_frame.paragraphs[0]
-        flp.text = short_main_title
-        flp.font.name = theme.font_name
-        flp.font.size = Pt(10)
-        flp.font.color.rgb = RGBColor(*theme.muted_text)
+        _set_run_text(
+            f_left.text_frame.paragraphs[0],
+            short_main_title,
+            theme.font_name,
+            Pt(10.5),
+            theme.muted_text,
+        )
 
         f_right = slide.shapes.add_textbox(Inches(11.3), Inches(6.95), Inches(1.38), Inches(0.35))
-        frp = f_right.text_frame.paragraphs[0]
-        frp.alignment = PP_ALIGN.RIGHT
-        frp.text = f"{idx} / {total_slides}"
-        frp.font.name = theme.font_name
-        frp.font.bold = True
-        frp.font.size = Pt(10.5)
-        frp.font.color.rgb = RGBColor(*theme.muted_text)
+        _set_run_text(
+            f_right.text_frame.paragraphs[0],
+            f"{idx} / {total_slides}",
+            theme.font_name,
+            Pt(10.5),
+            theme.muted_text,
+            bold=True,
+            align=PP_ALIGN.RIGHT,
+        )
 
-        # Ma'ruzachi eslatmalari (Speaker Notes)
         _set_notes(slide, slide_info.speaker_notes)
 
     # ------------------------------------------------------------------
@@ -1118,52 +1226,41 @@ def _build_styled_pptx(
     # ------------------------------------------------------------------
     closing = prs.slides.add_slide(blank_layout)
     _set_slide_bg(closing, theme.bg_cover)
-    _add_rect(closing, Inches(0), Inches(0), Inches(13.333), Inches(0.16), theme.primary)
-    _add_rect(closing, Inches(0), Inches(7.34), Inches(13.333), Inches(0.16), theme.secondary)
+    _add_rect(closing, Inches(0), Inches(0), Inches(13.333), Inches(0.18), theme.primary)
+    _add_rect(closing, Inches(0), Inches(7.32), Inches(13.333), Inches(0.18), theme.secondary)
 
-    # Sarlavha: Xulosa
-    ch_box = closing.shapes.add_textbox(Inches(0.95), Inches(0.75), Inches(11.4), Inches(0.85))
-    chp = ch_box.text_frame.paragraphs[0]
-    chp.text = conclusion_heading
-    chp.font.name = theme.font_name
-    chp.font.bold = True
-    chp.font.size = Pt(32)
-    chp.font.color.rgb = RGBColor(*theme.cover_title)
+    ch_box = closing.shapes.add_textbox(Inches(0.95), Inches(0.72), Inches(11.4), Inches(0.85))
+    _set_run_text(
+        ch_box.text_frame.paragraphs[0],
+        conclusion_heading,
+        theme.font_name,
+        Pt(32),
+        theme.cover_title,
+        bold=True,
+    )
 
-    _add_rect(closing, Inches(0.95), Inches(1.62), Inches(2.2), Inches(0.07), theme.secondary)
+    _add_rect(closing, Inches(0.95), Inches(1.62), Inches(2.4), Inches(0.08), theme.secondary)
 
-    conclusions = data.conclusion_points or [
-        s.title for s in data.slides[:3]
-    ]
-    c_box = closing.shapes.add_textbox(Inches(0.95), Inches(2.0), Inches(11.4), Inches(3.2))
+    conclusions = data.conclusion_points or [s.title for s in data.slides[:3]]
+    c_box = closing.shapes.add_textbox(Inches(0.95), Inches(2.0), Inches(11.4), Inches(3.25))
     c_tf = c_box.text_frame
     c_tf.word_wrap = True
     for c_idx, point in enumerate(conclusions[:4]):
         p = c_tf.paragraphs[0] if c_idx == 0 else c_tf.add_paragraph()
         p.space_after = Pt(16)
         p.line_spacing = 1.25
+        _set_run_text(p, "✓  ", theme.font_name, Pt(20), theme.primary, bold=True)
+        _set_run_text(p, point.strip(), theme.font_name, Pt(19), theme.cover_title)
 
-        r1 = p.add_run()
-        r1.text = "✓  "
-        r1.font.name = theme.font_name
-        r1.font.bold = True
-        r1.font.size = Pt(20)
-        r1.font.color.rgb = RGBColor(*theme.primary)
-
-        r2 = p.add_run()
-        r2.text = point.strip()
-        r2.font.name = theme.font_name
-        r2.font.size = Pt(19)
-        r2.font.color.rgb = RGBColor(*theme.cover_title)
-
-    # Pastki "Rahmat!" bloki
     ty_box = closing.shapes.add_textbox(Inches(0.95), Inches(5.65), Inches(11.4), Inches(0.9))
-    typ = ty_box.text_frame.paragraphs[0]
-    typ.text = thank_you_text
-    typ.font.name = theme.font_name
-    typ.font.bold = True
-    typ.font.size = Pt(28)
-    typ.font.color.rgb = RGBColor(*theme.secondary)
+    _set_run_text(
+        ty_box.text_frame.paragraphs[0],
+        thank_you_text,
+        theme.font_name,
+        Pt(28),
+        theme.secondary,
+        bold=True,
+    )
 
     prs.save(output_path)
 
@@ -1179,8 +1276,8 @@ def build_pptx_with_template(
 ) -> None:
     theme = THEMES[tpl_key]
 
-    # Agar maxsus .pptx shablon fayli diskda mavjud bo'lsa, undan foydalanamiz
-    if os.path.exists(theme.template_path):
+    # Faqat USE_CUSTOM_TEMPLATES=true yoqilganda va shablon fayli mavjud bo'lganda tashqi shablon ishlatiladi
+    if USE_CUSTOM_TEMPLATES and os.path.exists(theme.template_path):
         prs = Presentation(theme.template_path)
         for i in range(len(prs.slides) - 1, -1, -1):
             rId = prs.slides._sldIdLst[i].rId
@@ -1201,10 +1298,7 @@ def build_pptx_with_template(
             if slide.shapes.title:
                 slide.shapes.title.text = slide_info.title
 
-            body_shape = next(
-                (s for s in slide.placeholders if s.placeholder_format.idx == 1),
-                None,
-            )
+            body_shape = next((s for s in slide.placeholders if s.placeholder_format.idx == 1), None)
             if body_shape:
                 if img_stream:
                     body_shape.left = Inches(0.7)
@@ -1215,43 +1309,22 @@ def build_pptx_with_template(
                 font_size = calculate_optimal_font_size(slide_info.points, has_image=bool(img_stream))
                 for i, point in enumerate(slide_info.points):
                     p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
-                    p.text = point
-                    p.level = 0
-                    p.font.size = font_size
+                    _set_run_text(p, point, theme.font_name, font_size, theme.body_text)
 
             if img_stream:
                 try:
                     img_stream.seek(0)
                     slide.shapes.add_picture(
-                        img_stream,
-                        left=Inches(7.4),
-                        top=Inches(1.8),
-                        width=Inches(5.2),
-                        height=Inches(3.9),
+                        img_stream, left=Inches(7.4), top=Inches(1.8), width=Inches(5.2), height=Inches(3.9)
                     )
                 except Exception as img_err:
                     logger.warning("Shablonda rasm qo'yishda xato: %s", img_err)
 
             _set_notes(slide, slide_info.speaker_notes)
 
-        # Xulosa slaydi
-        _, _, conclusion_heading, thank_you_text = LANGUAGES[lang_key]
-        closing = prs.slides.add_slide(content_layout)
-        if closing.shapes.title:
-            closing.shapes.title.text = conclusion_heading
-        body_shape = next((s for s in closing.placeholders if s.placeholder_format.idx == 1), None)
-        if body_shape:
-            tf = body_shape.text_frame
-            tf.clear()
-            for i, point in enumerate((data.conclusion_points or []) + [thank_you_text]):
-                p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
-                p.text = point
-                p.font.size = Pt(18)
-
         prs.save(output_path)
         return
 
-    # Aks holda — o'rnatilgan zamonaviy dasturiy dizayn bilan chizamiz
     _build_styled_pptx(
         data=data,
         images=images,
@@ -1264,33 +1337,241 @@ def build_pptx_with_template(
 
 
 # ==============================================================================
-# .PPTX -> .PDF KONVERTATSIYA (PARALLEL ISHLASHGA XAVFSIZ)
+# .PDF YARATISH (LIBREOFFICE + PILLOW PURE-PYTHON FALLBACK)
 # ==============================================================================
-def convert_pptx_to_pdf(pptx_path: str, output_dir: str) -> Optional[str]:
-    profile_dir = os.path.join(output_dir, "lo_profile")
+def _load_ttf(size: int, bold: bool = False) -> ImageFont.ImageFont:
+    candidates = (
+        [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+            "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+            "/System/Library/Fonts/Helvetica.ttc",
+        ]
+        if bold
+        else [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+            "/System/Library/Fonts/Supplemental/Arial.ttf",
+            "/System/Library/Fonts/Helvetica.ttc",
+        ]
+    )
+    for path in candidates:
+        if os.path.exists(path):
+            try:
+                return ImageFont.truetype(path, size=size)
+            except Exception:
+                continue
+    return ImageFont.load_default()
+
+
+def _draw_wrapped_text(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    x: int,
+    y: int,
+    max_width_px: int,
+    font: ImageFont.ImageFont,
+    color: Tuple[int, int, int],
+    line_spacing: int = 10,
+    max_lines: int = 10,
+) -> int:
+    words = text.split()
+    lines: List[str] = []
+    current = ""
+    for word in words:
+        candidate = f"{current} {word}".strip()
+        bbox = draw.textbbox((0, 0), candidate, font=font)
+        if bbox[2] - bbox[0] <= max_width_px or not current:
+            current = candidate
+        else:
+            lines.append(current)
+            current = word
+            if len(lines) >= max_lines - 1:
+                break
+    if current and len(lines) < max_lines:
+        lines.append(current)
+
+    cur_y = y
+    for line in lines:
+        draw.text((x, cur_y), line, font=font, fill=color)
+        bbox = draw.textbbox((0, 0), line, font=font)
+        cur_y += (bbox[3] - bbox[1]) + line_spacing
+    return cur_y
+
+
+def render_slides_to_pdf_pillow(
+    data: PresentationData,
+    images: List[Optional[io.BytesIO]],
+    tpl_key: str,
+    lang_key: str,
+    style_label: str,
+    author_name: str,
+    pdf_path: str,
+) -> Optional[str]:
+    """LibreOffice (soffice) o'rnatilmagan serverlarda ham to'liq rangli PDF chizib beradi."""
     try:
-        subprocess.run(
-            [
-                "soffice",
-                f"-env:UserInstallation=file://{profile_dir}",
-                "--headless",
-                "--norestore",
-                "--convert-to",
-                "pdf",
-                pptx_path,
-                "--outdir",
-                output_dir,
-            ],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=45,
-        )
-        pdf_path = pptx_path.rsplit(".", 1)[0] + ".pdf"
+        theme = THEMES[tpl_key]
+        _, _, conclusion_heading, thank_you_text = LANGUAGES[lang_key]
+        W, H = 1600, 900
+        total_slides = len(data.slides) + 2
+        today_str = datetime.now().strftime("%d.%m.%Y")
+        clean_style = re.sub(r"^[^\w]+", "", style_label).strip().upper() or "PRESENTATION"
+        pages: List[Image.Image] = []
+
+        f_cover_title = _load_ttf(56 if len(data.main_title) <= 50 else 44, bold=True)
+        f_cover_sub = _load_ttf(28, bold=False)
+        f_badge = _load_ttf(18, bold=True)
+        f_header = _load_ttf(34, bold=True)
+        f_body = _load_ttf(25, bold=False)
+        f_meta = _load_ttf(18, bold=False)
+        f_closing_title = _load_ttf(46, bold=True)
+        f_thanks = _load_ttf(40, bold=True)
+
+        # 1. Cover slide
+        img = Image.new("RGB", (W, H), theme.bg_cover)
+        d = ImageDraw.Draw(img)
+        d.rectangle([0, 0, 42, H], fill=theme.primary)
+        d.rectangle([1265, 0, W, H], fill=theme.primary)
+        d.rectangle([1222, 0, 1265, H], fill=theme.secondary)
+        d.rounded_rectangle([1335, 130, 1530, 320], radius=16, fill=theme.bg_cover)
+        d.rounded_rectangle([1335, 370, 1530, 398], radius=10, fill=theme.secondary)
+
+        d.rounded_rectangle([115, 110, 520, 170], radius=14, fill=theme.primary)
+        d.text((145, 128), clean_style[:26], font=f_badge, fill=(255, 255, 255))
+
+        y_after = _draw_wrapped_text(d, data.main_title, 115, 225, 1050, f_cover_title, theme.cover_title, 14, 4)
+        bar_y = max(y_after + 24, 490)
+        d.rectangle([115, bar_y, 385, bar_y + 10], fill=theme.secondary)
+        _draw_wrapped_text(d, data.subtitle, 115, bar_y + 36, 1030, f_cover_sub, theme.cover_subtitle, 10, 4)
+        footer_meta = f"{author_name}  •  {today_str}" if author_name else today_str
+        d.text((115, 795), footer_meta, font=f_meta, fill=theme.cover_subtitle)
+        pages.append(img)
+
+        # 2. Content slides
+        short_title = textwrap.shorten(data.main_title, width=55, placeholder="...")
+        for idx, (s, img_stream) in enumerate(zip(data.slides, images), start=2):
+            page = Image.new("RGB", (W, H), theme.bg_slide)
+            d = ImageDraw.Draw(page)
+            d.rectangle([0, 0, W, 146], fill=theme.header_bg)
+            d.rectangle([0, 146, W, 154], fill=theme.secondary)
+
+            d.rounded_rectangle([72, 38, 158, 108], radius=12, fill=theme.primary)
+            d.text((95, 55), f"{idx - 1:02d}", font=_load_ttf(26, bold=True), fill=(255, 255, 255))
+            _draw_wrapped_text(d, s.title, 185, 45, 1340, f_header, theme.header_text, 6, 2)
+
+            has_img = img_stream is not None
+            img_left_side = has_img and (idx % 2 == 1)
+            if has_img:
+                if img_left_side:
+                    img_box = (78, 230, 708, 702)
+                    card_box = (750, 194, 1522, 806)
+                else:
+                    card_box = (78, 194, 850, 806)
+                    img_box = (892, 230, 1522, 702)
+
+                d.rectangle([img_box[0] + 14, img_box[1] + 14, img_box[2] + 14, img_box[3] + 14], fill=theme.secondary)
+                try:
+                    img_stream.seek(0)
+                    with Image.open(img_stream) as pil_img:
+                        resized = ImageOps.fit(
+                            pil_img.convert("RGB"),
+                            (img_box[2] - img_box[0], img_box[3] - img_box[1]),
+                            method=Image.Resampling.LANCZOS,
+                        )
+                        page.paste(resized, (img_box[0], img_box[1]))
+                except Exception:
+                    pass
+            else:
+                card_box = (78, 194, 1522, 806)
+
+            d.rounded_rectangle(card_box, radius=18, fill=theme.card_bg, outline=theme.card_border, width=2)
+            d.rectangle([card_box[0], card_box[1] + 30, card_box[0] + 12, card_box[3] - 30], fill=theme.primary)
+
+            text_x = card_box[0] + 44
+            text_w = (card_box[2] - card_box[0]) - 80
+            cur_y = card_box[1] + 48
+            body_font = _load_ttf(22 if has_img else 26, bold=False)
+            for point in s.points:
+                d.text((text_x, cur_y), "•", font=_load_ttf(26, bold=True), fill=theme.primary)
+                cur_y = _draw_wrapped_text(d, point.strip(), text_x + 28, cur_y + 2, text_w - 30, body_font, theme.body_text, 8, 4)
+                cur_y += 18
+                if cur_y > card_box[3] - 40:
+                    break
+
+            d.text((78, 842), short_title, font=f_meta, fill=theme.muted_text)
+            d.text((1440, 842), f"{idx} / {total_slides}", font=f_meta, fill=theme.muted_text)
+            pages.append(page)
+
+        # 3. Closing slide
+        closing = Image.new("RGB", (W, H), theme.bg_cover)
+        d = ImageDraw.Draw(closing)
+        d.rectangle([0, 0, W, 22], fill=theme.primary)
+        d.rectangle([0, H - 22, W, H], fill=theme.secondary)
+        d.text((115, 92), conclusion_heading, font=f_closing_title, fill=theme.cover_title)
+        d.rectangle([115, 175, 405, 185], fill=theme.secondary)
+
+        conclusions = data.conclusion_points or [s.title for s in data.slides[:3]]
+        cur_y = 235
+        for pt in conclusions[:4]:
+            d.text((115, cur_y), "✓", font=_load_ttf(28, bold=True), fill=theme.primary)
+            cur_y = _draw_wrapped_text(d, pt.strip(), 160, cur_y, 1320, f_cover_sub, theme.cover_title, 10, 3)
+            cur_y += 24
+        d.text((115, 695), thank_you_text, font=f_thanks, fill=theme.secondary)
+        pages.append(closing)
+
+        pages[0].save(pdf_path, "PDF", resolution=150.0, save_all=True, append_images=pages[1:])
         return pdf_path if os.path.exists(pdf_path) else None
     except Exception as e:
-        logger.warning("PDF konvertatsiya amalga oshmadi: %s", e)
+        logger.warning("Pillow PDF yaratishda xatolik: %s", e)
         return None
+
+
+def convert_pptx_to_pdf(
+    pptx_path: str,
+    output_dir: str,
+    data: PresentationData,
+    images: List[Optional[io.BytesIO]],
+    tpl_key: str,
+    lang_key: str,
+    style_label: str,
+    author_name: str,
+) -> Optional[str]:
+    pdf_path = pptx_path.rsplit(".", 1)[0] + ".pdf"
+
+    if shutil.which("soffice"):
+        profile_dir = os.path.join(output_dir, "lo_profile")
+        try:
+            subprocess.run(
+                [
+                    "soffice",
+                    f"-env:UserInstallation=file://{profile_dir}",
+                    "--headless",
+                    "--norestore",
+                    "--convert-to",
+                    "pdf",
+                    pptx_path,
+                    "--outdir",
+                    output_dir,
+                ],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=45,
+            )
+            if os.path.exists(pdf_path):
+                return pdf_path
+        except Exception as e:
+            logger.warning("LibreOffice PDF konvertatsiya xatosi, Pillow fallback ishlatiladi: %s", e)
+
+    return render_slides_to_pdf_pillow(
+        data=data,
+        images=images,
+        tpl_key=tpl_key,
+        lang_key=lang_key,
+        style_label=style_label,
+        author_name=author_name,
+        pdf_path=pdf_path,
+    )
 
 
 # ==============================================================================
@@ -1662,6 +1943,7 @@ async def process_template(callback: CallbackQuery, state: FSMContext):
     style_key = data.get("style_key", "academic")
     lang_label, lang_instruction, _, _ = LANGUAGES[lang_key]
     style_label, style_instruction = STYLES[style_key]
+    author_name = callback.from_user.full_name or ""
 
     header_line = f"🎨 <b>{theme.label}</b> | 🌐 {lang_label} | ✍️ {style_label}"
     status_msg = await callback.message.edit_text(
@@ -1700,10 +1982,20 @@ async def process_template(callback: CallbackQuery, state: FSMContext):
                 tpl_key,
                 lang_key,
                 style_label,
-                callback.from_user.full_name or "",
+                author_name,
                 pptx_file,
             )
-            pdf_file = await asyncio.to_thread(convert_pptx_to_pdf, pptx_file, tmpdir)
+            pdf_file = await asyncio.to_thread(
+                convert_pptx_to_pdf,
+                pptx_file,
+                tmpdir,
+                pres_data,
+                images,
+                tpl_key,
+                lang_key,
+                style_label,
+                author_name,
+            )
 
             safe_name = (
                 "".join(
